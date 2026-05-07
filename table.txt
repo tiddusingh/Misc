@@ -1,0 +1,1818 @@
+
+/*
+================================================================================
+HREA / Study / ANZCTR / ClinicalTrials.gov Logical Model
+Physical Azure SQL Creation Script
+================================================================================
+
+Purpose:
+- Creates a complete Azure SQL schema for managing Study / Protocol data.
+- Supports prepopulation of NHMRC HREA, ANZCTR, ClinicalTrials.gov, CTN/CTA,
+  SSA and related research governance outputs.
+- Uses a standards-aware structure with lookup/reference values.
+- Script is rerunnable. It drops existing objects in dependency order and rebuilds.
+
+Important:
+- Do not store NHMRC HREA full copyrighted question wording unless appropriately
+  licensed/approved. This script supports storing licensed wording in:
+  form.FormQuestion.QuestionTextLicensed.
+
+Schemas:
+- ref      : Reference and lookup data
+- study    : Study, protocol, site, participant, data and risk domains
+- ethics   : Ethics and governance approvals
+- form     : Form prepopulation/mapping layer
+- audit    : Optional audit support
+
+Target:
+- Azure SQL Database / SQL Server
+================================================================================
+*/
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+GO
+
+/*==============================================================================
+  1. DROP EXISTING OBJECTS - RERUNNABLE
+==============================================================================*/
+
+-- Drop foreign-key dependent tables first
+
+IF OBJECT_ID('form.AnswerCandidate', 'U') IS NOT NULL DROP TABLE form.AnswerCandidate;
+IF OBJECT_ID('form.FormQuestionMapping', 'U') IS NOT NULL DROP TABLE form.FormQuestionMapping;
+IF OBJECT_ID('form.FormQuestion', 'U') IS NOT NULL DROP TABLE form.FormQuestion;
+
+IF OBJECT_ID('ethics.GovernanceAuthorisation', 'U') IS NOT NULL DROP TABLE ethics.GovernanceAuthorisation;
+IF OBJECT_ID('ethics.EthicsApplication', 'U') IS NOT NULL DROP TABLE ethics.EthicsApplication;
+
+IF OBJECT_ID('study.SafetyMonitoring', 'U') IS NOT NULL DROP TABLE study.SafetyMonitoring;
+IF OBJECT_ID('study.RiskAssessment', 'U') IS NOT NULL DROP TABLE study.RiskAssessment;
+IF OBJECT_ID('study.DataSharingPlan', 'U') IS NOT NULL DROP TABLE study.DataSharingPlan;
+IF OBJECT_ID('study.DataLinkagePlan', 'U') IS NOT NULL DROP TABLE study.DataLinkagePlan;
+IF OBJECT_ID('study.StudyDataset', 'U') IS NOT NULL DROP TABLE study.StudyDataset;
+IF OBJECT_ID('study.Document', 'U') IS NOT NULL DROP TABLE study.Document;
+IF OBJECT_ID('study.StudyPersonRole', 'U') IS NOT NULL DROP TABLE study.StudyPersonRole;
+IF OBJECT_ID('study.Person', 'U') IS NOT NULL DROP TABLE study.Person;
+IF OBJECT_ID('study.StudySite', 'U') IS NOT NULL DROP TABLE study.StudySite;
+IF OBJECT_ID('study.Organisation', 'U') IS NOT NULL DROP TABLE study.Organisation;
+IF OBJECT_ID('study.OutcomeMeasure', 'U') IS NOT NULL DROP TABLE study.OutcomeMeasure;
+IF OBJECT_ID('study.ArmIntervention', 'U') IS NOT NULL DROP TABLE study.ArmIntervention;
+IF OBJECT_ID('study.Intervention', 'U') IS NOT NULL DROP TABLE study.Intervention;
+IF OBJECT_ID('study.StudyArm', 'U') IS NOT NULL DROP TABLE study.StudyArm;
+IF OBJECT_ID('study.ConsentModel', 'U') IS NOT NULL DROP TABLE study.ConsentModel;
+IF OBJECT_ID('study.RecruitmentPlan', 'U') IS NOT NULL DROP TABLE study.RecruitmentPlan;
+IF OBJECT_ID('study.EligibilityCriterion', 'U') IS NOT NULL DROP TABLE study.EligibilityCriterion;
+IF OBJECT_ID('study.ParticipantPopulation', 'U') IS NOT NULL DROP TABLE study.ParticipantPopulation;
+IF OBJECT_ID('study.StudyCondition', 'U') IS NOT NULL DROP TABLE study.StudyCondition;
+IF OBJECT_ID('study.StudyObjective', 'U') IS NOT NULL DROP TABLE study.StudyObjective;
+IF OBJECT_ID('study.StudyDesign', 'U') IS NOT NULL DROP TABLE study.StudyDesign;
+IF OBJECT_ID('study.StudyVersion', 'U') IS NOT NULL DROP TABLE study.StudyVersion;
+IF OBJECT_ID('study.StudyIdentifier', 'U') IS NOT NULL DROP TABLE study.StudyIdentifier;
+IF OBJECT_ID('study.Study', 'U') IS NOT NULL DROP TABLE study.Study;
+
+IF OBJECT_ID('ref.LookupValue', 'U') IS NOT NULL DROP TABLE ref.LookupValue;
+GO
+
+/*==============================================================================
+  2. CREATE SCHEMAS
+==============================================================================*/
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ref')
+    EXEC('CREATE SCHEMA ref');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'study')
+    EXEC('CREATE SCHEMA study');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ethics')
+    EXEC('CREATE SCHEMA ethics');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'form')
+    EXEC('CREATE SCHEMA form');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'audit')
+    EXEC('CREATE SCHEMA audit');
+GO
+
+/*==============================================================================
+  3. REFERENCE LOOKUP TABLE
+==============================================================================*/
+
+CREATE TABLE ref.LookupValue (
+    LookupValueId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    LookupType NVARCHAR(100) NOT NULL,
+    Code NVARCHAR(100) NOT NULL,
+    DisplayName NVARCHAR(255) NOT NULL,
+    Description NVARCHAR(MAX) NULL,
+    IsSystemValue BIT NOT NULL DEFAULT 1,
+    IsActive BIT NOT NULL DEFAULT 1,
+    SortOrder INT NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+    RowVersion ROWVERSION,
+
+    CONSTRAINT PK_LookupValue PRIMARY KEY CLUSTERED (LookupValueId),
+    CONSTRAINT UQ_LookupValue_Type_Code UNIQUE (LookupType, Code),
+    CONSTRAINT CK_LookupValue_LookupType_NotBlank CHECK (LEN(LTRIM(RTRIM(LookupType))) > 0),
+    CONSTRAINT CK_LookupValue_Code_NotBlank CHECK (LEN(LTRIM(RTRIM(Code))) > 0)
+);
+GO
+
+CREATE INDEX IX_LookupValue_LookupType
+ON ref.LookupValue (LookupType, IsActive, SortOrder);
+GO
+
+/*==============================================================================
+  4. SEED CORE LOOKUP VALUES
+==============================================================================*/
+
+INSERT INTO ref.LookupValue (LookupType, Code, DisplayName, Description, SortOrder)
+VALUES
+-- StudyType
+('StudyType','INTERVENTIONAL','Interventional','Interventional clinical or health research study',1),
+('StudyType','OBSERVATIONAL','Observational','Observational study',2),
+('StudyType','QUALITATIVE','Qualitative','Qualitative research',3),
+('StudyType','REGISTRY','Registry','Registry-based study',4),
+('StudyType','DATA_LINKAGE','Data linkage','Study using linked data',5),
+('StudyType','SURVEY','Survey','Survey/questionnaire study',6),
+('StudyType','BIOSPECIMEN','Biospecimen','Study involving biospecimens',7),
+('StudyType','HEALTH_SERVICES','Health services research','Health services or implementation research',8),
+
+-- StudyPhase
+('StudyPhase','NA','Not applicable','Not applicable',1),
+('StudyPhase','EARLY_PHASE_1','Early Phase 1','Early phase 1',2),
+('StudyPhase','PHASE_1','Phase 1','Phase 1',3),
+('StudyPhase','PHASE_1_2','Phase 1/2','Phase 1/2',4),
+('StudyPhase','PHASE_2','Phase 2','Phase 2',5),
+('StudyPhase','PHASE_2_3','Phase 2/3','Phase 2/3',6),
+('StudyPhase','PHASE_3','Phase 3','Phase 3',7),
+('StudyPhase','PHASE_4','Phase 4','Phase 4',8),
+
+-- RecruitmentStatus
+('RecruitmentStatus','NOT_YET_RECRUITING','Not yet recruiting','Recruitment has not started',1),
+('RecruitmentStatus','RECRUITING','Recruiting','Currently recruiting participants',2),
+('RecruitmentStatus','ENROLLING_BY_INVITATION','Enrolling by invitation','Participants are selected by invitation',3),
+('RecruitmentStatus','ACTIVE_NOT_RECRUITING','Active, not recruiting','Active but no longer recruiting',4),
+('RecruitmentStatus','SUSPENDED','Suspended','Temporarily suspended',5),
+('RecruitmentStatus','TERMINATED','Terminated','Stopped early',6),
+('RecruitmentStatus','COMPLETED','Completed','Study completed',7),
+('RecruitmentStatus','WITHDRAWN','Withdrawn','Withdrawn before enrolment',8),
+
+-- EthicsReviewPathway
+('EthicsReviewPathway','FULL_HREC','Full HREC review','Full Human Research Ethics Committee review',1),
+('EthicsReviewPathway','LOW_RISK','Low risk review','Low risk review pathway',2),
+('EthicsReviewPathway','NEGLIGIBLE_RISK','Negligible risk review','Negligible risk review pathway',3),
+('EthicsReviewPathway','NMA','National Mutual Acceptance','NMA review pathway',4),
+('EthicsReviewPathway','EXEMPT','Exempt / non-HREC pathway','Where institution determines HREC review not required',5),
+
+-- Allocation
+('Allocation','RANDOMISED','Randomised','Participants are randomly assigned',1),
+('Allocation','NON_RANDOMISED','Non-randomised','Allocation is not randomised',2),
+('Allocation','NA','Not applicable','Not applicable',3),
+
+-- InterventionModel
+('InterventionModel','PARALLEL','Parallel assignment','Parallel assignment model',1),
+('InterventionModel','CROSSOVER','Crossover assignment','Crossover assignment model',2),
+('InterventionModel','FACTORIAL','Factorial assignment','Factorial assignment model',3),
+('InterventionModel','SEQUENTIAL','Sequential assignment','Sequential assignment model',4),
+('InterventionModel','SINGLE_GROUP','Single group assignment','Single group assignment model',5),
+('InterventionModel','NA','Not applicable','Not applicable',6),
+
+-- ObservationalModel
+('ObservationalModel','COHORT','Cohort','Cohort observational model',1),
+('ObservationalModel','CASE_CONTROL','Case-control','Case-control observational model',2),
+('ObservationalModel','CASE_ONLY','Case-only','Case-only model',3),
+('ObservationalModel','CASE_CROSSOVER','Case-crossover','Case-crossover model',4),
+('ObservationalModel','ECOLOGIC','Ecologic/community','Ecologic model',5),
+('ObservationalModel','FAMILY_BASED','Family-based','Family-based model',6),
+('ObservationalModel','CROSS_SECTIONAL','Cross-sectional','Cross-sectional model',7),
+('ObservationalModel','REGISTRY','Registry','Registry model',8),
+('ObservationalModel','OTHER','Other','Other model',9),
+
+-- TimePerspective
+('TimePerspective','PROSPECTIVE','Prospective','Prospective study',1),
+('TimePerspective','RETROSPECTIVE','Retrospective','Retrospective study',2),
+('TimePerspective','CROSS_SECTIONAL','Cross-sectional','Cross-sectional study',3),
+('TimePerspective','OTHER','Other','Other time perspective',4),
+
+-- Masking
+('Masking','NONE','None / open label','No masking',1),
+('Masking','SINGLE','Single','Single masking',2),
+('Masking','DOUBLE','Double','Double masking',3),
+('Masking','TRIPLE','Triple','Triple masking',4),
+('Masking','QUADRUPLE','Quadruple','Quadruple masking',5),
+
+-- PrimaryPurpose
+('PrimaryPurpose','TREATMENT','Treatment','Treatment purpose',1),
+('PrimaryPurpose','PREVENTION','Prevention','Prevention purpose',2),
+('PrimaryPurpose','DIAGNOSTIC','Diagnostic','Diagnostic purpose',3),
+('PrimaryPurpose','SCREENING','Screening','Screening purpose',4),
+('PrimaryPurpose','SUPPORTIVE_CARE','Supportive care','Supportive care purpose',5),
+('PrimaryPurpose','HEALTH_SERVICES','Health services research','Health services research purpose',6),
+('PrimaryPurpose','BASIC_SCIENCE','Basic science','Basic science purpose',7),
+('PrimaryPurpose','OTHER','Other','Other purpose',8),
+
+-- ObjectiveType
+('ObjectiveType','PRIMARY','Primary','Primary objective',1),
+('ObjectiveType','SECONDARY','Secondary','Secondary objective',2),
+('ObjectiveType','EXPLORATORY','Exploratory','Exploratory objective',3),
+
+-- PopulationGroupType
+('PopulationGroupType','ADULTS','Adults','Adult participants',1),
+('PopulationGroupType','CHILDREN','Children / young people','Children or young people',2),
+('PopulationGroupType','PREGNANT','Pregnant people','Pregnant people',3),
+('PopulationGroupType','ABORIGINAL_TSI','Aboriginal and Torres Strait Islander peoples','Aboriginal and Torres Strait Islander peoples',4),
+('PopulationGroupType','IMPAIRED_CAPACITY','People with impaired decision-making capacity','Impaired capacity group',5),
+('PopulationGroupType','DEPENDENT_RELATIONSHIP','Dependent relationship','Participants in dependent relationships',6),
+('PopulationGroupType','OTHER_SPECIAL_GROUP','Other special group','Other special participant group',7),
+('PopulationGroupType','GENERAL','General population','General population',8),
+
+-- CriterionType
+('CriterionType','INCLUSION','Inclusion','Inclusion criterion',1),
+('CriterionType','EXCLUSION','Exclusion','Exclusion criterion',2),
+
+-- ConsentType
+('ConsentType','WRITTEN','Written consent','Written informed consent',1),
+('ConsentType','VERBAL','Verbal consent','Verbal consent',2),
+('ConsentType','OPT_OUT','Opt-out consent','Opt-out consent model',3),
+('ConsentType','WAIVER','Waiver of consent','Waiver of consent',4),
+('ConsentType','DEFERRED','Deferred consent','Deferred consent',5),
+('ConsentType','BROAD','Broad consent','Broad consent',6),
+('ConsentType','RECONSENT','Re-consent','Re-consent required',7),
+
+-- ArmType
+('ArmType','EXPERIMENTAL','Experimental','Experimental arm',1),
+('ArmType','ACTIVE_COMPARATOR','Active comparator','Active comparator arm',2),
+('ArmType','PLACEBO_COMPARATOR','Placebo comparator','Placebo comparator arm',3),
+('ArmType','SHAM_COMPARATOR','Sham comparator','Sham comparator arm',4),
+('ArmType','NO_INTERVENTION','No intervention','No intervention arm',5),
+('ArmType','OBSERVATIONAL_COHORT','Observational cohort','Observational cohort/group',6),
+('ArmType','OTHER','Other','Other arm type',7),
+
+-- InterventionType
+('InterventionType','DRUG','Drug','Drug intervention',1),
+('InterventionType','BIOLOGICAL','Biological','Biological intervention',2),
+('InterventionType','DEVICE','Device','Medical device',3),
+('InterventionType','PROCEDURE','Procedure','Procedure',4),
+('InterventionType','BEHAVIOURAL','Behavioural','Behavioural intervention',5),
+('InterventionType','DIAGNOSTIC_TEST','Diagnostic test','Diagnostic test',6),
+('InterventionType','RADIATION','Radiation','Radiation intervention',7),
+('InterventionType','DIETARY_SUPPLEMENT','Dietary supplement','Dietary supplement',8),
+('InterventionType','OTHER','Other','Other intervention',9),
+
+-- Route
+('Route','ORAL','Oral','Oral route',1),
+('Route','INTRAVENOUS','Intravenous','Intravenous route',2),
+('Route','SUBCUTANEOUS','Subcutaneous','Subcutaneous route',3),
+('Route','INTRAMUSCULAR','Intramuscular','Intramuscular route',4),
+('Route','TOPICAL','Topical','Topical route',5),
+('Route','INHALED','Inhaled','Inhaled route',6),
+('Route','OTHER','Other','Other route',7),
+('Route','NA','Not applicable','Not applicable',8),
+
+-- ARTGStatus
+('ARTGStatus','INCLUDED','Included in ARTG','Included in ARTG',1),
+('ARTGStatus','EXEMPT','Exempt','Exempt therapeutic good',2),
+('ARTGStatus','UNAPPROVED_CTN','Unapproved - CTN','Unapproved therapeutic good under CTN',3),
+('ARTGStatus','UNAPPROVED_CTA','Unapproved - CTA','Unapproved therapeutic good under CTA',4),
+('ARTGStatus','NA','Not applicable','Not applicable',5),
+
+-- OutcomeType
+('OutcomeType','PRIMARY','Primary','Primary outcome',1),
+('OutcomeType','SECONDARY','Secondary','Secondary outcome',2),
+('OutcomeType','EXPLORATORY','Exploratory','Exploratory outcome',3),
+('OutcomeType','SAFETY','Safety','Safety outcome',4),
+
+-- OrganisationType
+('OrganisationType','SPONSOR','Sponsor','Study sponsor',1),
+('OrganisationType','INSTITUTION','Institution','Research institution',2),
+('OrganisationType','SITE','Site','Study site',3),
+('OrganisationType','HREC','HREC','Human Research Ethics Committee',4),
+('OrganisationType','FUNDER','Funder','Funding body',5),
+('OrganisationType','CRO','CRO','Contract research organisation',6),
+('OrganisationType','LABORATORY','Laboratory','Laboratory',7),
+('OrganisationType','DATA_CUSTODIAN','Data custodian','Data custodian',8),
+('OrganisationType','LINKAGE_UNIT','Linkage unit','Data linkage unit',9),
+('OrganisationType','OTHER','Other','Other organisation type',10),
+
+-- SiteRole
+('SiteRole','LEAD_SITE','Lead site','Lead/coordinating site',1),
+('SiteRole','RECRUITING_SITE','Recruiting site','Participant recruiting site',2),
+('SiteRole','DATA_SITE','Data site','Data collection or data source site',3),
+('SiteRole','LAB_SITE','Laboratory site','Laboratory site',4),
+('SiteRole','OTHER','Other','Other site role',5),
+
+-- RoleType
+('RoleType','CPI','Coordinating principal investigator','CPI',1),
+('RoleType','PI','Principal investigator','PI',2),
+('RoleType','AI','Associate investigator','AI',3),
+('RoleType','STUDY_COORDINATOR','Study coordinator','Study coordinator',4),
+('RoleType','STATISTICIAN','Statistician','Statistician',5),
+('RoleType','DATA_CUSTODIAN','Data custodian','Data custodian',6),
+('RoleType','SPONSOR_REP','Sponsor representative','Sponsor representative',7),
+('RoleType','OTHER','Other','Other role',8),
+
+-- ReviewType
+('ReviewType','FULL_HREC','Full HREC review','Full HREC review',1),
+('ReviewType','LOW_RISK','Low risk review','Low risk review',2),
+('ReviewType','NEGLIGIBLE_RISK','Negligible risk review','Negligible risk review',3),
+('ReviewType','NMA','National Mutual Acceptance','NMA',4),
+('ReviewType','OTHER','Other','Other review type',5),
+
+-- ApprovalStatus
+('ApprovalStatus','DRAFT','Draft','Draft',1),
+('ApprovalStatus','SUBMITTED','Submitted','Submitted',2),
+('ApprovalStatus','APPROVED','Approved','Approved',3),
+('ApprovalStatus','APPROVED_WITH_CONDITIONS','Approved with conditions','Approved with conditions',4),
+('ApprovalStatus','REJECTED','Rejected','Rejected',5),
+('ApprovalStatus','WITHDRAWN','Withdrawn','Withdrawn',6),
+('ApprovalStatus','EXPIRED','Expired','Expired',7),
+
+-- GovernanceStatus / SSAStatus
+('GovernanceStatus','NOT_REQUIRED','Not required','Not required',1),
+('GovernanceStatus','NOT_STARTED','Not started','Not started',2),
+('GovernanceStatus','IN_PROGRESS','In progress','In progress',3),
+('GovernanceStatus','SUBMITTED','Submitted','Submitted',4),
+('GovernanceStatus','APPROVED','Approved','Approved',5),
+('GovernanceStatus','REJECTED','Rejected','Rejected',6),
+('SSAStatus','NOT_REQUIRED','Not required','Not required',1),
+('SSAStatus','NOT_STARTED','Not started','Not started',2),
+('SSAStatus','SUBMITTED','Submitted','Submitted',3),
+('SSAStatus','APPROVED','Approved','Approved',4),
+('SSAStatus','REJECTED','Rejected','Rejected',5),
+
+-- DatasetType
+('DatasetType','NEWLY_COLLECTED','Newly collected','Newly collected data',1),
+('DatasetType','EXISTING_DATASET','Existing dataset','Existing dataset',2),
+('DatasetType','LINKED_DATASET','Linked dataset','Linked dataset',3),
+('DatasetType','REGISTRY','Registry','Registry data',4),
+('DatasetType','EHR','Electronic health record','EHR data',5),
+('DatasetType','SURVEY','Survey','Survey data',6),
+('DatasetType','INTERVIEW','Interview','Interview data',7),
+('DatasetType','BIOSPECIMEN_DERIVED','Biospecimen-derived','Biospecimen-derived data',8),
+('DatasetType','OTHER','Other','Other dataset type',9),
+
+-- Identifiability
+('Identifiability','IDENTIFIABLE','Identifiable','Identifiable data',1),
+('Identifiability','REIDENTIFIABLE','Re-identifiable / coded','Coded or re-identifiable data',2),
+('Identifiability','NON_IDENTIFIABLE','Non-identifiable','Non-identifiable data',3),
+
+-- LinkageMethod
+('LinkageMethod','DETERMINISTIC','Deterministic','Deterministic linkage',1),
+('LinkageMethod','PROBABILISTIC','Probabilistic','Probabilistic linkage',2),
+('LinkageMethod','MANUAL','Manual','Manual linkage',3),
+('LinkageMethod','PRIVACY_PRESERVING','Privacy-preserving','Privacy-preserving linkage',4),
+('LinkageMethod','THIRD_PARTY','Third-party linkage unit','Third-party linkage unit',5),
+
+-- RiskCategory
+('RiskCategory','NEGLIGIBLE','Negligible risk','Negligible risk',1),
+('RiskCategory','LOW','Low risk','Low risk',2),
+('RiskCategory','MORE_THAN_LOW','More than low risk','More than low risk',3),
+
+-- RiskLevel
+('RiskLevel','LOW','Low','Low risk',1),
+('RiskLevel','MEDIUM','Medium','Medium risk',2),
+('RiskLevel','HIGH','High','High risk',3),
+
+-- IPDSharingPlan
+('IPDSharingPlan','YES','Yes','IPD sharing planned',1),
+('IPDSharingPlan','NO','No','IPD sharing not planned',2),
+('IPDSharingPlan','UNDECIDED','Undecided','IPD sharing undecided',3),
+
+-- DocumentType
+('DocumentType','PROTOCOL','Protocol','Study protocol',1),
+('DocumentType','PISCF','Participant information sheet and consent form','PISCF',2),
+('DocumentType','SAP','Statistical analysis plan','SAP',3),
+('DocumentType','RECRUITMENT_MATERIAL','Recruitment material','Recruitment material',4),
+('DocumentType','DMP','Data management plan','Data management plan',5),
+('DocumentType','INSURANCE','Insurance','Insurance document',6),
+('DocumentType','INDEMNITY','Indemnity','Indemnity document',7),
+('DocumentType','CV','CV','Researcher CV',8),
+('DocumentType','GCP_CERTIFICATE','GCP certificate','GCP training certificate',9),
+('DocumentType','OTHER','Other','Other document',10),
+
+-- FormType
+('FormType','HREA','NHMRC HREA','Human Research Ethics Application',1),
+('FormType','ANZCTR','ANZCTR','Australian New Zealand Clinical Trials Registry',2),
+('FormType','CLINICALTRIALS_GOV','ClinicalTrials.gov','ClinicalTrials.gov',3),
+('FormType','CTN','CTN','Clinical Trial Notification',4),
+('FormType','CTA','CTA','Clinical Trial Approval',5),
+('FormType','SSA','SSA','Site Specific Assessment',6),
+('FormType','DMP','DMP','Data Management Plan',7),
+
+-- QuestionAnswerStatus
+('QuestionAnswerStatus','GENERATED','Generated','Generated by system',1),
+('QuestionAnswerStatus','HUMAN_EDITED','Human edited','Human edited',2),
+('QuestionAnswerStatus','APPROVED','Approved','Approved final answer',3),
+('QuestionAnswerStatus','REJECTED','Rejected','Rejected answer',4);
+GO
+
+/*==============================================================================
+  5. STUDY MASTER
+==============================================================================*/
+
+CREATE TABLE study.Study (
+    StudyId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    ProtocolNumber NVARCHAR(100) NOT NULL,
+    OfficialTitle NVARCHAR(1000) NOT NULL,
+    BriefTitle NVARCHAR(500) NOT NULL,
+    Acronym NVARCHAR(100) NULL,
+
+    StudyTypeId UNIQUEIDENTIFIER NOT NULL,
+    StudyPhaseId UNIQUEIDENTIFIER NULL,
+    RecruitmentStatusId UNIQUEIDENTIFIER NOT NULL,
+    EthicsReviewPathwayId UNIQUEIDENTIFIER NULL,
+
+    IsClinicalTrial BIT NOT NULL DEFAULT 0,
+    IsTherapeuticGoodsTrial BIT NOT NULL DEFAULT 0,
+    IsCTN BIT NOT NULL DEFAULT 0,
+    IsCTA BIT NOT NULL DEFAULT 0,
+    IsMultiSite BIT NOT NULL DEFAULT 0,
+
+    LaySummary NVARCHAR(MAX) NULL,
+    ScientificSummary NVARCHAR(MAX) NULL,
+    HealthArea NVARCHAR(500) NULL,
+    StudyPurposeText NVARCHAR(MAX) NULL,
+
+    PlannedStartDate DATE NULL,
+    ActualStartDate DATE NULL,
+    PrimaryCompletionDate DATE NULL,
+    StudyCompletionDate DATE NULL,
+
+    CurrentProtocolVersion NVARCHAR(50) NULL,
+    ProtocolDate DATE NULL,
+
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+    RowVersion ROWVERSION,
+
+    CONSTRAINT PK_Study PRIMARY KEY CLUSTERED (StudyId),
+    CONSTRAINT UQ_Study_ProtocolNumber UNIQUE (ProtocolNumber),
+
+    CONSTRAINT FK_Study_StudyType
+        FOREIGN KEY (StudyTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_Study_StudyPhase
+        FOREIGN KEY (StudyPhaseId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_Study_RecruitmentStatus
+        FOREIGN KEY (RecruitmentStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_Study_EthicsReviewPathway
+        FOREIGN KEY (EthicsReviewPathwayId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_Study_ProtocolNumber_NotBlank CHECK (LEN(LTRIM(RTRIM(ProtocolNumber))) > 0),
+    CONSTRAINT CK_Study_OfficialTitle_NotBlank CHECK (LEN(LTRIM(RTRIM(OfficialTitle))) > 0),
+    CONSTRAINT CK_Study_BriefTitle_NotBlank CHECK (LEN(LTRIM(RTRIM(BriefTitle))) > 0),
+    CONSTRAINT CK_Study_CTN_CTA_NotBoth CHECK (NOT (IsCTN = 1 AND IsCTA = 1))
+);
+GO
+
+CREATE INDEX IX_Study_StudyType ON study.Study (StudyTypeId);
+CREATE INDEX IX_Study_RecruitmentStatus ON study.Study (RecruitmentStatusId);
+CREATE INDEX IX_Study_Dates ON study.Study (PlannedStartDate, StudyCompletionDate);
+GO
+
+/*==============================================================================
+  6. STUDY IDENTIFIERS AND VERSIONING
+==============================================================================*/
+
+CREATE TABLE study.StudyIdentifier (
+    StudyIdentifierId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    IdentifierTypeId UNIQUEIDENTIFIER NOT NULL,
+    IdentifierValue NVARCHAR(255) NOT NULL,
+    IssuingAuthority NVARCHAR(255) NOT NULL,
+    IsPrimaryIdentifier BIT NOT NULL DEFAULT 0,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyIdentifier PRIMARY KEY CLUSTERED (StudyIdentifierId),
+
+    CONSTRAINT FK_StudyIdentifier_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyIdentifier_IdentifierType
+        FOREIGN KEY (IdentifierTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT UQ_StudyIdentifier UNIQUE (StudyId, IdentifierTypeId, IdentifierValue),
+    CONSTRAINT CK_StudyIdentifier_Value_NotBlank CHECK (LEN(LTRIM(RTRIM(IdentifierValue))) > 0)
+);
+GO
+
+CREATE INDEX IX_StudyIdentifier_Study ON study.StudyIdentifier (StudyId);
+CREATE INDEX IX_StudyIdentifier_Value ON study.StudyIdentifier (IdentifierValue);
+GO
+
+CREATE TABLE study.StudyVersion (
+    StudyVersionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    VersionNumber NVARCHAR(50) NOT NULL,
+    VersionDate DATE NOT NULL,
+    StatusId UNIQUEIDENTIFIER NOT NULL,
+    ChangeSummary NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyVersion PRIMARY KEY CLUSTERED (StudyVersionId),
+
+    CONSTRAINT FK_StudyVersion_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyVersion_Status
+        FOREIGN KEY (StatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT UQ_StudyVersion UNIQUE (StudyId, VersionNumber)
+);
+GO
+
+CREATE INDEX IX_StudyVersion_Study ON study.StudyVersion (StudyId);
+GO
+
+/*==============================================================================
+  7. STUDY DESIGN AND OBJECTIVES
+==============================================================================*/
+
+CREATE TABLE study.StudyDesign (
+    StudyDesignId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    AllocationId UNIQUEIDENTIFIER NULL,
+    InterventionModelId UNIQUEIDENTIFIER NULL,
+    ObservationalModelId UNIQUEIDENTIFIER NULL,
+    TimePerspectiveId UNIQUEIDENTIFIER NULL,
+    MaskingId UNIQUEIDENTIFIER NULL,
+    PrimaryPurposeId UNIQUEIDENTIFIER NULL,
+
+    NumberOfArms INT NULL,
+    EstimatedEnrolment INT NULL,
+    ActualEnrolment INT NULL,
+    SampleSizeJustification NVARCHAR(MAX) NULL,
+    PowerCalculationText NVARCHAR(MAX) NULL,
+    StatisticalAnalysisPlanSummary NVARCHAR(MAX) NULL,
+
+    RandomisationDescription NVARCHAR(MAX) NULL,
+    MaskingDescription NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyDesign PRIMARY KEY CLUSTERED (StudyDesignId),
+    CONSTRAINT UQ_StudyDesign_Study UNIQUE (StudyId),
+
+    CONSTRAINT FK_StudyDesign_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyDesign_Allocation
+        FOREIGN KEY (AllocationId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDesign_InterventionModel
+        FOREIGN KEY (InterventionModelId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDesign_ObservationalModel
+        FOREIGN KEY (ObservationalModelId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDesign_TimePerspective
+        FOREIGN KEY (TimePerspectiveId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDesign_Masking
+        FOREIGN KEY (MaskingId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDesign_PrimaryPurpose
+        FOREIGN KEY (PrimaryPurposeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_StudyDesign_NumberOfArms CHECK (NumberOfArms IS NULL OR NumberOfArms >= 0),
+    CONSTRAINT CK_StudyDesign_EstimatedEnrolment CHECK (EstimatedEnrolment IS NULL OR EstimatedEnrolment >= 0),
+    CONSTRAINT CK_StudyDesign_ActualEnrolment CHECK (ActualEnrolment IS NULL OR ActualEnrolment >= 0)
+);
+GO
+
+CREATE TABLE study.StudyObjective (
+    StudyObjectiveId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    ObjectiveTypeId UNIQUEIDENTIFIER NOT NULL,
+    ObjectiveText NVARCHAR(MAX) NOT NULL,
+    SortOrder INT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyObjective PRIMARY KEY CLUSTERED (StudyObjectiveId),
+
+    CONSTRAINT FK_StudyObjective_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyObjective_ObjectiveType
+        FOREIGN KEY (ObjectiveTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_StudyObjective_SortOrder CHECK (SortOrder > 0)
+);
+GO
+
+CREATE INDEX IX_StudyObjective_Study ON study.StudyObjective (StudyId, SortOrder);
+GO
+
+/*==============================================================================
+  8. CONDITIONS
+==============================================================================*/
+
+CREATE TABLE study.StudyCondition (
+    StudyConditionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    ConditionName NVARCHAR(500) NOT NULL,
+    SNOMEDCTAUCode NVARCHAR(100) NULL,
+    ICD10AMCode NVARCHAR(100) NULL,
+    MeSHCode NVARCHAR(100) NULL,
+    RegistryDisplayTerm NVARCHAR(500) NULL,
+    IsPrimaryCondition BIT NOT NULL DEFAULT 0,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyCondition PRIMARY KEY CLUSTERED (StudyConditionId),
+
+    CONSTRAINT FK_StudyCondition_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT CK_StudyCondition_Name_NotBlank CHECK (LEN(LTRIM(RTRIM(ConditionName))) > 0)
+);
+GO
+
+CREATE INDEX IX_StudyCondition_Study ON study.StudyCondition (StudyId);
+CREATE INDEX IX_StudyCondition_SNOMED ON study.StudyCondition (SNOMEDCTAUCode);
+CREATE INDEX IX_StudyCondition_ICD10AM ON study.StudyCondition (ICD10AMCode);
+CREATE INDEX IX_StudyCondition_MeSH ON study.StudyCondition (MeSHCode);
+GO
+
+/*==============================================================================
+  9. PARTICIPANTS, ELIGIBILITY, RECRUITMENT, CONSENT
+==============================================================================*/
+
+CREATE TABLE study.ParticipantPopulation (
+    ParticipantPopulationId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    GroupTypeId UNIQUEIDENTIFIER NOT NULL,
+    VulnerableFlag BIT NOT NULL DEFAULT 0,
+    Description NVARCHAR(MAX) NOT NULL,
+    RationaleForInclusion NVARCHAR(MAX) NULL,
+    Safeguards NVARCHAR(MAX) NULL,
+
+    MinimumAge NVARCHAR(100) NULL,
+    MaximumAge NVARCHAR(100) NULL,
+    SexOrGenderEligibility NVARCHAR(255) NULL,
+    HealthyVolunteersAccepted BIT NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_ParticipantPopulation PRIMARY KEY CLUSTERED (ParticipantPopulationId),
+
+    CONSTRAINT FK_ParticipantPopulation_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_ParticipantPopulation_GroupType
+        FOREIGN KEY (GroupTypeId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_ParticipantPopulation_Study ON study.ParticipantPopulation (StudyId);
+GO
+
+CREATE TABLE study.EligibilityCriterion (
+    EligibilityCriterionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    ParticipantPopulationId UNIQUEIDENTIFIER NOT NULL,
+
+    CriterionTypeId UNIQUEIDENTIFIER NOT NULL,
+    CriterionText NVARCHAR(MAX) NOT NULL,
+    SNOMEDCode NVARCHAR(100) NULL,
+    Category NVARCHAR(255) NULL,
+    MachineReadableExpression NVARCHAR(MAX) NULL,
+    SortOrder INT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_EligibilityCriterion PRIMARY KEY CLUSTERED (EligibilityCriterionId),
+
+    CONSTRAINT FK_EligibilityCriterion_Population
+        FOREIGN KEY (ParticipantPopulationId)
+        REFERENCES study.ParticipantPopulation(ParticipantPopulationId),
+
+    CONSTRAINT FK_EligibilityCriterion_CriterionType
+        FOREIGN KEY (CriterionTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_EligibilityCriterion_SortOrder CHECK (SortOrder > 0)
+);
+GO
+
+CREATE INDEX IX_EligibilityCriterion_Population ON study.EligibilityCriterion (ParticipantPopulationId, SortOrder);
+CREATE INDEX IX_EligibilityCriterion_SNOMED ON study.EligibilityCriterion (SNOMEDCode);
+GO
+
+CREATE TABLE study.RecruitmentPlan (
+    RecruitmentPlanId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    RecruitmentMethod NVARCHAR(MAX) NOT NULL,
+    RecruitmentSetting NVARCHAR(500) NULL,
+    TargetNumber INT NULL,
+    ScreeningProcess NVARCHAR(MAX) NULL,
+    Reimbursement NVARCHAR(MAX) NULL,
+    UndueInfluenceRisk NVARCHAR(MAX) NULL,
+
+    RecruitmentMaterialsDescription NVARCHAR(MAX) NULL,
+    RecruitmentStartDate DATE NULL,
+    RecruitmentEndDate DATE NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_RecruitmentPlan PRIMARY KEY CLUSTERED (RecruitmentPlanId),
+
+    CONSTRAINT FK_RecruitmentPlan_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT CK_RecruitmentPlan_TargetNumber CHECK (TargetNumber IS NULL OR TargetNumber >= 0)
+);
+GO
+
+CREATE INDEX IX_RecruitmentPlan_Study ON study.RecruitmentPlan (StudyId);
+GO
+
+CREATE TABLE study.ConsentModel (
+    ConsentModelId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    ConsentTypeId UNIQUEIDENTIFIER NOT NULL,
+    WaiverFlag BIT NOT NULL DEFAULT 0,
+    DeferredConsentFlag BIT NOT NULL DEFAULT 0,
+
+    ConsentProcessDescription NVARCHAR(MAX) NULL,
+    WhoObtainsConsent NVARCHAR(500) NULL,
+    CapacityAssessmentRequired BIT NOT NULL DEFAULT 0,
+    SubstituteDecisionMakerAllowed BIT NOT NULL DEFAULT 0,
+    WithdrawalProcess NVARCHAR(MAX) NULL,
+    ReConsentTriggers NVARCHAR(MAX) NULL,
+
+    ParticipantInformationSheetRequired BIT NOT NULL DEFAULT 1,
+    ConsentFormRequired BIT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_ConsentModel PRIMARY KEY CLUSTERED (ConsentModelId),
+
+    CONSTRAINT FK_ConsentModel_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_ConsentModel_ConsentType
+        FOREIGN KEY (ConsentTypeId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_ConsentModel_Study ON study.ConsentModel (StudyId);
+GO
+
+/*==============================================================================
+  10. ARMS AND INTERVENTIONS
+==============================================================================*/
+
+CREATE TABLE study.StudyArm (
+    StudyArmId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    ArmTypeId UNIQUEIDENTIFIER NOT NULL,
+    ArmName NVARCHAR(500) NOT NULL,
+    ArmDescription NVARCHAR(MAX) NULL,
+    TargetSampleSize INT NULL,
+    SortOrder INT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyArm PRIMARY KEY CLUSTERED (StudyArmId),
+
+    CONSTRAINT FK_StudyArm_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyArm_ArmType
+        FOREIGN KEY (ArmTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_StudyArm_TargetSampleSize CHECK (TargetSampleSize IS NULL OR TargetSampleSize >= 0),
+    CONSTRAINT CK_StudyArm_SortOrder CHECK (SortOrder > 0)
+);
+GO
+
+CREATE INDEX IX_StudyArm_Study ON study.StudyArm (StudyId, SortOrder);
+GO
+
+CREATE TABLE study.Intervention (
+    InterventionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    InterventionTypeId UNIQUEIDENTIFIER NOT NULL,
+    InterventionName NVARCHAR(500) NOT NULL,
+    Description NVARCHAR(MAX) NULL,
+
+    Dose NVARCHAR(255) NULL,
+    RouteId UNIQUEIDENTIFIER NULL,
+    Frequency NVARCHAR(255) NULL,
+    Duration NVARCHAR(255) NULL,
+
+    AMTCode NVARCHAR(100) NULL,
+    ATCCode NVARCHAR(100) NULL,
+    ARTGStatusId UNIQUEIDENTIFIER NULL,
+    ARTGNumber NVARCHAR(100) NULL,
+
+    DeviceIdentifier NVARCHAR(255) NULL,
+    Manufacturer NVARCHAR(255) NULL,
+    SponsorSuppliedFlag BIT NOT NULL DEFAULT 0,
+
+    KnownRisks NVARCHAR(MAX) NULL,
+    Contraindications NVARCHAR(MAX) NULL,
+    ComparatorFlag BIT NOT NULL DEFAULT 0,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_Intervention PRIMARY KEY CLUSTERED (InterventionId),
+
+    CONSTRAINT FK_Intervention_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_Intervention_Type
+        FOREIGN KEY (InterventionTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_Intervention_Route
+        FOREIGN KEY (RouteId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_Intervention_ARTGStatus
+        FOREIGN KEY (ARTGStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_Intervention_Name_NotBlank CHECK (LEN(LTRIM(RTRIM(InterventionName))) > 0)
+);
+GO
+
+CREATE INDEX IX_Intervention_Study ON study.Intervention (StudyId);
+CREATE INDEX IX_Intervention_AMT ON study.Intervention (AMTCode);
+CREATE INDEX IX_Intervention_ATC ON study.Intervention (ATCCode);
+CREATE INDEX IX_Intervention_ARTGNumber ON study.Intervention (ARTGNumber);
+GO
+
+CREATE TABLE study.ArmIntervention (
+    ArmInterventionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyArmId UNIQUEIDENTIFIER NOT NULL,
+    InterventionId UNIQUEIDENTIFIER NOT NULL,
+
+    SequenceNumber INT NULL,
+    Timing NVARCHAR(255) NULL,
+    Notes NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_ArmIntervention PRIMARY KEY CLUSTERED (ArmInterventionId),
+
+    CONSTRAINT FK_ArmIntervention_Arm
+        FOREIGN KEY (StudyArmId) REFERENCES study.StudyArm(StudyArmId),
+
+    CONSTRAINT FK_ArmIntervention_Intervention
+        FOREIGN KEY (InterventionId) REFERENCES study.Intervention(InterventionId),
+
+    CONSTRAINT UQ_ArmIntervention UNIQUE (StudyArmId, InterventionId)
+);
+GO
+
+CREATE INDEX IX_ArmIntervention_Arm ON study.ArmIntervention (StudyArmId);
+CREATE INDEX IX_ArmIntervention_Intervention ON study.ArmIntervention (InterventionId);
+GO
+
+/*==============================================================================
+  11. OUTCOMES
+==============================================================================*/
+
+CREATE TABLE study.OutcomeMeasure (
+    OutcomeMeasureId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    OutcomeTypeId UNIQUEIDENTIFIER NOT NULL,
+    MeasureName NVARCHAR(500) NOT NULL,
+    Description NVARCHAR(MAX) NOT NULL,
+    TimeFrame NVARCHAR(255) NOT NULL,
+    AssessmentMethod NVARCHAR(MAX) NULL,
+    Metric NVARCHAR(255) NULL,
+    AnalysisPopulation NVARCHAR(500) NULL,
+
+    RelatedObjectiveId UNIQUEIDENTIFIER NULL,
+    LOINCCode NVARCHAR(100) NULL,
+    SNOMEDCode NVARCHAR(100) NULL,
+
+    IsRegistryReported BIT NOT NULL DEFAULT 1,
+    SortOrder INT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_OutcomeMeasure PRIMARY KEY CLUSTERED (OutcomeMeasureId),
+
+    CONSTRAINT FK_OutcomeMeasure_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_OutcomeMeasure_OutcomeType
+        FOREIGN KEY (OutcomeTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_OutcomeMeasure_RelatedObjective
+        FOREIGN KEY (RelatedObjectiveId) REFERENCES study.StudyObjective(StudyObjectiveId),
+
+    CONSTRAINT CK_OutcomeMeasure_SortOrder CHECK (SortOrder > 0)
+);
+GO
+
+CREATE INDEX IX_OutcomeMeasure_Study ON study.OutcomeMeasure (StudyId, SortOrder);
+CREATE INDEX IX_OutcomeMeasure_LOINC ON study.OutcomeMeasure (LOINCCode);
+CREATE INDEX IX_OutcomeMeasure_SNOMED ON study.OutcomeMeasure (SNOMEDCode);
+GO
+
+/*==============================================================================
+  12. ORGANISATIONS, SITES, PEOPLE
+==============================================================================*/
+
+CREATE TABLE study.Organisation (
+    OrganisationId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    OrganisationName NVARCHAR(500) NOT NULL,
+    OrganisationTypeId UNIQUEIDENTIFIER NOT NULL,
+    ABN NVARCHAR(20) NULL,
+
+    AddressLine1 NVARCHAR(255) NULL,
+    AddressLine2 NVARCHAR(255) NULL,
+    Suburb NVARCHAR(100) NULL,
+    StateCode NVARCHAR(20) NULL,
+    Postcode NVARCHAR(20) NULL,
+    CountryCode NVARCHAR(10) NULL,
+
+    Phone NVARCHAR(100) NULL,
+    Email NVARCHAR(255) NULL,
+    Website NVARCHAR(500) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_Organisation PRIMARY KEY CLUSTERED (OrganisationId),
+
+    CONSTRAINT FK_Organisation_Type
+        FOREIGN KEY (OrganisationTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_Organisation_Name_NotBlank CHECK (LEN(LTRIM(RTRIM(OrganisationName))) > 0)
+);
+GO
+
+CREATE INDEX IX_Organisation_Name ON study.Organisation (OrganisationName);
+CREATE INDEX IX_Organisation_ABN ON study.Organisation (ABN);
+GO
+
+CREATE TABLE study.StudySite (
+    StudySiteId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+    OrganisationId UNIQUEIDENTIFIER NOT NULL,
+
+    SiteRoleId UNIQUEIDENTIFIER NOT NULL,
+    SiteRecruitmentStatusId UNIQUEIDENTIFIER NULL,
+    GovernanceStatusId UNIQUEIDENTIFIER NULL,
+
+    LocationDescription NVARCHAR(500) NULL,
+    IsLeadSite BIT NOT NULL DEFAULT 0,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudySite PRIMARY KEY CLUSTERED (StudySiteId),
+
+    CONSTRAINT FK_StudySite_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudySite_Organisation
+        FOREIGN KEY (OrganisationId) REFERENCES study.Organisation(OrganisationId),
+
+    CONSTRAINT FK_StudySite_SiteRole
+        FOREIGN KEY (SiteRoleId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudySite_RecruitmentStatus
+        FOREIGN KEY (SiteRecruitmentStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudySite_GovernanceStatus
+        FOREIGN KEY (GovernanceStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT UQ_StudySite UNIQUE (StudyId, OrganisationId, SiteRoleId)
+);
+GO
+
+CREATE INDEX IX_StudySite_Study ON study.StudySite (StudyId);
+CREATE INDEX IX_StudySite_Organisation ON study.StudySite (OrganisationId);
+GO
+
+CREATE TABLE study.Person (
+    PersonId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    GivenName NVARCHAR(255) NULL,
+    FamilyName NVARCHAR(255) NULL,
+    FullName NVARCHAR(500) NOT NULL,
+    Email NVARCHAR(255) NULL,
+    Phone NVARCHAR(100) NULL,
+    Qualification NVARCHAR(500) NULL,
+    ORCID NVARCHAR(100) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_Person PRIMARY KEY CLUSTERED (PersonId),
+    CONSTRAINT CK_Person_FullName_NotBlank CHECK (LEN(LTRIM(RTRIM(FullName))) > 0)
+);
+GO
+
+CREATE INDEX IX_Person_FullName ON study.Person (FullName);
+CREATE INDEX IX_Person_Email ON study.Person (Email);
+CREATE INDEX IX_Person_ORCID ON study.Person (ORCID);
+GO
+
+CREATE TABLE study.StudyPersonRole (
+    StudyPersonRoleId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+    PersonId UNIQUEIDENTIFIER NOT NULL,
+    OrganisationId UNIQUEIDENTIFIER NULL,
+
+    RoleTypeId UNIQUEIDENTIFIER NOT NULL,
+    Responsibilities NVARCHAR(MAX) NULL,
+    GCPTrainingDate DATE NULL,
+    CVDocumentId UNIQUEIDENTIFIER NULL,
+
+    IsPrimaryContact BIT NOT NULL DEFAULT 0,
+    IsPublicContact BIT NOT NULL DEFAULT 0,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyPersonRole PRIMARY KEY CLUSTERED (StudyPersonRoleId),
+
+    CONSTRAINT FK_StudyPersonRole_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyPersonRole_Person
+        FOREIGN KEY (PersonId) REFERENCES study.Person(PersonId),
+
+    CONSTRAINT FK_StudyPersonRole_Organisation
+        FOREIGN KEY (OrganisationId) REFERENCES study.Organisation(OrganisationId),
+
+    CONSTRAINT FK_StudyPersonRole_RoleType
+        FOREIGN KEY (RoleTypeId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_StudyPersonRole_Study ON study.StudyPersonRole (StudyId);
+CREATE INDEX IX_StudyPersonRole_Person ON study.StudyPersonRole (PersonId);
+CREATE INDEX IX_StudyPersonRole_Organisation ON study.StudyPersonRole (OrganisationId);
+GO
+
+/*==============================================================================
+  13. DOCUMENTS
+==============================================================================*/
+
+CREATE TABLE study.Document (
+    DocumentId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    DocumentTypeId UNIQUEIDENTIFIER NOT NULL,
+    FileName NVARCHAR(500) NOT NULL,
+    VersionNumber NVARCHAR(50) NULL,
+    DocumentDate DATE NULL,
+
+    StorageUri NVARCHAR(2000) NOT NULL,
+    MimeType NVARCHAR(255) NULL,
+    FileSizeBytes BIGINT NULL,
+    HashValue NVARCHAR(500) NULL,
+
+    IsCurrent BIT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_Document PRIMARY KEY CLUSTERED (DocumentId),
+
+    CONSTRAINT FK_Document_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_Document_DocumentType
+        FOREIGN KEY (DocumentTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_Document_FileSize CHECK (FileSizeBytes IS NULL OR FileSizeBytes >= 0)
+);
+GO
+
+CREATE INDEX IX_Document_Study ON study.Document (StudyId, IsCurrent);
+CREATE INDEX IX_Document_Type ON study.Document (DocumentTypeId);
+GO
+
+-- Add CV document FK now that Document exists
+ALTER TABLE study.StudyPersonRole
+ADD CONSTRAINT FK_StudyPersonRole_CVDocument
+FOREIGN KEY (CVDocumentId) REFERENCES study.Document(DocumentId);
+GO
+
+/*==============================================================================
+  14. ETHICS AND GOVERNANCE
+==============================================================================*/
+
+CREATE TABLE ethics.EthicsApplication (
+    EthicsApplicationId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    HREAReference NVARCHAR(100) NULL,
+    HRECOrganisationId UNIQUEIDENTIFIER NULL,
+
+    ReviewTypeId UNIQUEIDENTIFIER NOT NULL,
+    ApprovalStatusId UNIQUEIDENTIFIER NOT NULL,
+
+    SubmissionDate DATE NULL,
+    ApprovalDate DATE NULL,
+    ApprovalNumber NVARCHAR(100) NULL,
+    ApprovalConditions NVARCHAR(MAX) NULL,
+
+    NMAFlag BIT NOT NULL DEFAULT 0,
+    LeadHRECFlag BIT NOT NULL DEFAULT 0,
+    JurisdictionsCovered NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_EthicsApplication PRIMARY KEY CLUSTERED (EthicsApplicationId),
+
+    CONSTRAINT FK_EthicsApplication_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_EthicsApplication_HRECOrganisation
+        FOREIGN KEY (HRECOrganisationId) REFERENCES study.Organisation(OrganisationId),
+
+    CONSTRAINT FK_EthicsApplication_ReviewType
+        FOREIGN KEY (ReviewTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_EthicsApplication_ApprovalStatus
+        FOREIGN KEY (ApprovalStatusId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_EthicsApplication_Study ON ethics.EthicsApplication (StudyId);
+CREATE INDEX IX_EthicsApplication_HREAReference ON ethics.EthicsApplication (HREAReference);
+CREATE INDEX IX_EthicsApplication_ApprovalNumber ON ethics.EthicsApplication (ApprovalNumber);
+GO
+
+CREATE TABLE ethics.GovernanceAuthorisation (
+    GovernanceAuthorisationId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+    StudySiteId UNIQUEIDENTIFIER NOT NULL,
+
+    SSAStatusId UNIQUEIDENTIFIER NOT NULL,
+    SubmittedDate DATE NULL,
+    ApprovalDate DATE NULL,
+
+    ContractsRequired BIT NOT NULL DEFAULT 0,
+    IndemnityRequired BIT NOT NULL DEFAULT 0,
+    InsuranceRequired BIT NOT NULL DEFAULT 0,
+
+    Notes NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_GovernanceAuthorisation PRIMARY KEY CLUSTERED (GovernanceAuthorisationId),
+
+    CONSTRAINT FK_GovernanceAuthorisation_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_GovernanceAuthorisation_StudySite
+        FOREIGN KEY (StudySiteId) REFERENCES study.StudySite(StudySiteId),
+
+    CONSTRAINT FK_GovernanceAuthorisation_SSAStatus
+        FOREIGN KEY (SSAStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT UQ_GovernanceAuthorisation_StudySite UNIQUE (StudyId, StudySiteId)
+);
+GO
+
+CREATE INDEX IX_GovernanceAuthorisation_Study ON ethics.GovernanceAuthorisation (StudyId);
+CREATE INDEX IX_GovernanceAuthorisation_StudySite ON ethics.GovernanceAuthorisation (StudySiteId);
+GO
+
+/*==============================================================================
+  15. DATA, PRIVACY, LINKAGE, SHARING
+==============================================================================*/
+
+CREATE TABLE study.StudyDataset (
+    StudyDatasetId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    DatasetName NVARCHAR(500) NOT NULL,
+    DatasetTypeId UNIQUEIDENTIFIER NOT NULL,
+
+    DataSource NVARCHAR(500) NULL,
+    DataCustodianOrganisationId UNIQUEIDENTIFIER NULL,
+
+    ContainsPersonalInformation BIT NOT NULL DEFAULT 0,
+    ContainsSensitiveInformation BIT NOT NULL DEFAULT 0,
+    ContainsHealthInformation BIT NOT NULL DEFAULT 0,
+
+    IdentifiabilityId UNIQUEIDENTIFIER NOT NULL,
+
+    CollectionMethod NVARCHAR(MAX) NULL,
+    CollectionTimepoints NVARCHAR(MAX) NULL,
+
+    StorageLocation NVARCHAR(1000) NULL,
+    StorageSystem NVARCHAR(500) NULL,
+    RetentionPeriod NVARCHAR(255) NULL,
+    DestructionOrArchivePlan NVARCHAR(MAX) NULL,
+
+    AccessControls NVARCHAR(MAX) NULL,
+    EncryptionAtRestFlag BIT NULL,
+    EncryptionInTransitFlag BIT NULL,
+
+    CrossBorderDisclosureFlag BIT NOT NULL DEFAULT 0,
+    CrossBorderDisclosureDetails NVARCHAR(MAX) NULL,
+
+    IncidentalFindingsFlag BIT NULL,
+    IncidentalFindingsManagementPlan NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_StudyDataset PRIMARY KEY CLUSTERED (StudyDatasetId),
+
+    CONSTRAINT FK_StudyDataset_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_StudyDataset_DatasetType
+        FOREIGN KEY (DatasetTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_StudyDataset_DataCustodian
+        FOREIGN KEY (DataCustodianOrganisationId) REFERENCES study.Organisation(OrganisationId),
+
+    CONSTRAINT FK_StudyDataset_Identifiability
+        FOREIGN KEY (IdentifiabilityId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_StudyDataset_Name_NotBlank CHECK (LEN(LTRIM(RTRIM(DatasetName))) > 0)
+);
+GO
+
+CREATE INDEX IX_StudyDataset_Study ON study.StudyDataset (StudyId);
+CREATE INDEX IX_StudyDataset_DataCustodian ON study.StudyDataset (DataCustodianOrganisationId);
+CREATE INDEX IX_StudyDataset_Identifiability ON study.StudyDataset (IdentifiabilityId);
+GO
+
+CREATE TABLE study.DataLinkagePlan (
+    DataLinkagePlanId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    SourceDatasetId UNIQUEIDENTIFIER NOT NULL,
+    TargetDatasetId UNIQUEIDENTIFIER NOT NULL,
+
+    LinkageMethodId UNIQUEIDENTIFIER NOT NULL,
+    LinkageKeys NVARCHAR(MAX) NULL,
+    LinkageUnit NVARCHAR(500) NULL,
+
+    SeparationPrincipleUsed BIT NOT NULL DEFAULT 0,
+    ReidentificationRiskId UNIQUEIDENTIFIER NULL,
+    MitigationControls NVARCHAR(MAX) NULL,
+    ConsentBasis NVARCHAR(MAX) NULL,
+    LegalAuthority NVARCHAR(MAX) NULL,
+
+    LinkageDescription NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_DataLinkagePlan PRIMARY KEY CLUSTERED (DataLinkagePlanId),
+
+    CONSTRAINT FK_DataLinkagePlan_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_DataLinkagePlan_SourceDataset
+        FOREIGN KEY (SourceDatasetId) REFERENCES study.StudyDataset(StudyDatasetId),
+
+    CONSTRAINT FK_DataLinkagePlan_TargetDataset
+        FOREIGN KEY (TargetDatasetId) REFERENCES study.StudyDataset(StudyDatasetId),
+
+    CONSTRAINT FK_DataLinkagePlan_Method
+        FOREIGN KEY (LinkageMethodId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT FK_DataLinkagePlan_ReidentificationRisk
+        FOREIGN KEY (ReidentificationRiskId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_DataLinkagePlan_DifferentDatasets
+        CHECK (SourceDatasetId <> TargetDatasetId)
+);
+GO
+
+CREATE INDEX IX_DataLinkagePlan_Study ON study.DataLinkagePlan (StudyId);
+CREATE INDEX IX_DataLinkagePlan_SourceDataset ON study.DataLinkagePlan (SourceDatasetId);
+CREATE INDEX IX_DataLinkagePlan_TargetDataset ON study.DataLinkagePlan (TargetDatasetId);
+GO
+
+CREATE TABLE study.DataSharingPlan (
+    DataSharingPlanId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    IPDSharingPlanId UNIQUEIDENTIFIER NULL,
+    DataToShare NVARCHAR(MAX) NULL,
+    SupportingDocumentsToShare NVARCHAR(MAX) NULL,
+    WhenAvailable NVARCHAR(500) NULL,
+    AccessCriteria NVARCHAR(MAX) NULL,
+    AccessMechanism NVARCHAR(MAX) NULL,
+
+    FutureUseAllowed BIT NULL,
+    SecondaryUseLimits NVARCHAR(MAX) NULL,
+    PublicationPlan NVARCHAR(MAX) NULL,
+    ResultsReturnPlan NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_DataSharingPlan PRIMARY KEY CLUSTERED (DataSharingPlanId),
+
+    CONSTRAINT FK_DataSharingPlan_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_DataSharingPlan_IPDSharingPlan
+        FOREIGN KEY (IPDSharingPlanId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_DataSharingPlan_Study ON study.DataSharingPlan (StudyId);
+GO
+
+/*==============================================================================
+  16. RISK AND SAFETY
+==============================================================================*/
+
+CREATE TABLE study.RiskAssessment (
+    RiskAssessmentId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    RiskCategoryId UNIQUEIDENTIFIER NULL,
+
+    PhysicalRisk NVARCHAR(MAX) NULL,
+    PsychologicalRisk NVARCHAR(MAX) NULL,
+    SocialRisk NVARCHAR(MAX) NULL,
+    LegalRisk NVARCHAR(MAX) NULL,
+    EconomicRisk NVARCHAR(MAX) NULL,
+    CulturalRisk NVARCHAR(MAX) NULL,
+    PrivacyRisk NVARCHAR(MAX) NULL,
+
+    RiskMitigation NVARCHAR(MAX) NOT NULL,
+    BenefitDescription NVARCHAR(MAX) NULL,
+    RiskBenefitJustification NVARCHAR(MAX) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_RiskAssessment PRIMARY KEY CLUSTERED (RiskAssessmentId),
+
+    CONSTRAINT FK_RiskAssessment_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_RiskAssessment_RiskCategory
+        FOREIGN KEY (RiskCategoryId) REFERENCES ref.LookupValue(LookupValueId)
+);
+GO
+
+CREATE INDEX IX_RiskAssessment_Study ON study.RiskAssessment (StudyId);
+GO
+
+CREATE TABLE study.SafetyMonitoring (
+    SafetyMonitoringId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+
+    DSMBRequired BIT NOT NULL DEFAULT 0,
+    SafetyMonitoringPlan NVARCHAR(MAX) NULL,
+    AEReportingPlan NVARCHAR(MAX) NULL,
+    SAEReportingPlan NVARCHAR(MAX) NULL,
+    SUSARReportingPlan NVARCHAR(MAX) NULL,
+    StoppingRules NVARCHAR(MAX) NULL,
+    MedicalMonitor NVARCHAR(500) NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_SafetyMonitoring PRIMARY KEY CLUSTERED (SafetyMonitoringId),
+
+    CONSTRAINT FK_SafetyMonitoring_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId)
+);
+GO
+
+CREATE INDEX IX_SafetyMonitoring_Study ON study.SafetyMonitoring (StudyId);
+GO
+
+/*==============================================================================
+  17. FORM PREPOPULATION LAYER
+==============================================================================*/
+
+CREATE TABLE form.FormQuestion (
+    FormQuestionId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    FormTypeId UNIQUEIDENTIFIER NOT NULL,
+    FormSection NVARCHAR(255) NOT NULL,
+    QuestionCode NVARCHAR(100) NOT NULL,
+
+    -- Use QuestionName / QuestionIntent freely. Store exact copyrighted question
+    -- wording only if licensed or permitted.
+    QuestionName NVARCHAR(500) NOT NULL,
+    QuestionIntent NVARCHAR(MAX) NULL,
+    QuestionTextLicensed NVARCHAR(MAX) NULL,
+
+    QuestionVersion NVARCHAR(50) NULL,
+    IsConditionalQuestion BIT NOT NULL DEFAULT 0,
+    IsActive BIT NOT NULL DEFAULT 1,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+    UpdatedAt DATETIME2(3) NULL,
+    UpdatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_FormQuestion PRIMARY KEY CLUSTERED (FormQuestionId),
+
+    CONSTRAINT FK_FormQuestion_FormType
+        FOREIGN KEY (FormTypeId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT UQ_FormQuestion UNIQUE (FormTypeId, QuestionCode)
+);
+GO
+
+CREATE INDEX IX_FormQuestion_FormType_Section ON form.FormQuestion (FormTypeId, FormSection);
+GO
+
+CREATE TABLE form.FormQuestionMapping (
+    FormQuestionMappingId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    FormQuestionId UNIQUEIDENTIFIER NOT NULL,
+
+    SourceSchemaName NVARCHAR(128) NOT NULL,
+    SourceEntity NVARCHAR(128) NOT NULL,
+    SourceAttribute NVARCHAR(128) NOT NULL,
+
+    TransformationRule NVARCHAR(MAX) NULL,
+    RequiredCondition NVARCHAR(MAX) NULL,
+    NeedsHumanReviewFlag BIT NOT NULL DEFAULT 1,
+
+    ConfidenceWeight DECIMAL(5,4) NULL,
+
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_FormQuestionMapping PRIMARY KEY CLUSTERED (FormQuestionMappingId),
+
+    CONSTRAINT FK_FormQuestionMapping_FormQuestion
+        FOREIGN KEY (FormQuestionId) REFERENCES form.FormQuestion(FormQuestionId),
+
+    CONSTRAINT CK_FormQuestionMapping_ConfidenceWeight
+        CHECK (ConfidenceWeight IS NULL OR ConfidenceWeight BETWEEN 0 AND 1)
+);
+GO
+
+CREATE INDEX IX_FormQuestionMapping_FormQuestion ON form.FormQuestionMapping (FormQuestionId);
+CREATE INDEX IX_FormQuestionMapping_Source ON form.FormQuestionMapping (SourceSchemaName, SourceEntity, SourceAttribute);
+GO
+
+CREATE TABLE form.AnswerCandidate (
+    AnswerCandidateId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+
+    StudyId UNIQUEIDENTIFIER NOT NULL,
+    FormQuestionId UNIQUEIDENTIFIER NOT NULL,
+
+    AnswerStatusId UNIQUEIDENTIFIER NULL,
+
+    GeneratedAnswerText NVARCHAR(MAX) NULL,
+    ConfidenceScore DECIMAL(5,4) NULL,
+
+    HumanEditedAnswer NVARCHAR(MAX) NULL,
+    ApprovedAnswer NVARCHAR(MAX) NULL,
+    ApprovedBy NVARCHAR(255) NULL,
+    ApprovedDate DATETIME2(3) NULL,
+
+    SourceFieldsUsed NVARCHAR(MAX) NULL,
+    SourceDocumentRefs NVARCHAR(MAX) NULL,
+    GenerationRunId UNIQUEIDENTIFIER NULL,
+
+    CreatedAt DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy NVARCHAR(255) NULL,
+
+    CONSTRAINT PK_AnswerCandidate PRIMARY KEY CLUSTERED (AnswerCandidateId),
+
+    CONSTRAINT FK_AnswerCandidate_Study
+        FOREIGN KEY (StudyId) REFERENCES study.Study(StudyId),
+
+    CONSTRAINT FK_AnswerCandidate_FormQuestion
+        FOREIGN KEY (FormQuestionId) REFERENCES form.FormQuestion(FormQuestionId),
+
+    CONSTRAINT FK_AnswerCandidate_Status
+        FOREIGN KEY (AnswerStatusId) REFERENCES ref.LookupValue(LookupValueId),
+
+    CONSTRAINT CK_AnswerCandidate_ConfidenceScore
+        CHECK (ConfidenceScore IS NULL OR ConfidenceScore BETWEEN 0 AND 1)
+);
+GO
+
+CREATE INDEX IX_AnswerCandidate_Study_Question ON form.AnswerCandidate (StudyId, FormQuestionId);
+CREATE INDEX IX_AnswerCandidate_Status ON form.AnswerCandidate (AnswerStatusId);
+GO
+
+/*==============================================================================
+  18. SEED PRACTICAL HREA QUESTION CATALOGUE WITHOUT COPYRIGHTED FULL TEXT
+==============================================================================*/
+
+DECLARE @HREA UNIQUEIDENTIFIER =
+(
+    SELECT LookupValueId
+    FROM ref.LookupValue
+    WHERE LookupType = 'FormType'
+      AND Code = 'HREA'
+);
+
+INSERT INTO form.FormQuestion
+(
+    FormTypeId,
+    FormSection,
+    QuestionCode,
+    QuestionName,
+    QuestionIntent,
+    QuestionVersion
+)
+VALUES
+(@HREA,'Project Overview','HREA.PROJECT.TITLE','Project title','Captures the study/project title for ethics review','Public section mapping'),
+(@HREA,'Project Overview','HREA.PROJECT.LAY_SUMMARY','Lay summary','Plain language project description','Public section mapping'),
+(@HREA,'Project Overview','HREA.PROJECT.SCIENTIFIC_BACKGROUND','Scientific background','Scientific rationale/background for the project','Public section mapping'),
+(@HREA,'Project Overview','HREA.PROJECT.AIMS','Aims and objectives','Research aims/objectives','Public section mapping'),
+(@HREA,'Project Overview','HREA.PROJECT.STUDY_TYPE','Type of research','Research type and design category','Public section mapping'),
+(@HREA,'Project Team','HREA.TEAM.MEMBERS','Project team members','Research team, roles and responsibilities','Public section mapping'),
+(@HREA,'Project Team','HREA.TEAM.QUALIFICATIONS','Team qualifications','Qualifications/experience relevant to conduct of study','Public section mapping'),
+(@HREA,'Disclosure of Interest','HREA.COI.INTERESTS','Disclosure of interests','Conflicts, sponsorship, financial or other interests','Public section mapping'),
+(@HREA,'Scientific Merit','HREA.MERIT.DESIGN','Scientific merit and design','Justification of design, sample size and methods','Public section mapping'),
+(@HREA,'Location','HREA.LOCATION.SITES','Research locations/sites','Where research is conducted','Public section mapping'),
+(@HREA,'Methods','HREA.METHODS.DESIGN','Study design and methodology','Methods, design and procedures','Public section mapping'),
+(@HREA,'Methods','HREA.METHODS.INTERVENTIONS','Interventions or exposures','Interventions, exposures, comparators','Public section mapping'),
+(@HREA,'Methods','HREA.METHODS.OUTCOMES','Outcomes and assessments','Outcomes, assessments and timeframes','Public section mapping'),
+(@HREA,'Participant Specific','HREA.PARTICIPANTS.GROUPS','Participant groups','Participant population and special groups','Public section mapping'),
+(@HREA,'Participant Specific','HREA.PARTICIPANTS.ELIGIBILITY','Eligibility criteria','Inclusion and exclusion criteria','Public section mapping'),
+(@HREA,'Recruitment','HREA.RECRUITMENT.METHOD','Recruitment method','How participants are identified and recruited','Public section mapping'),
+(@HREA,'Recruitment','HREA.RECRUITMENT.INCENTIVES','Payments or incentives','Reimbursement, incentives, undue influence','Public section mapping'),
+(@HREA,'Consent','HREA.CONSENT.APPROACH','Consent approach','Consent model and process','Public section mapping'),
+(@HREA,'Consent','HREA.CONSENT.WAIVER','Waiver/deferred/opt-out consent','Non-standard consent pathway','Public section mapping'),
+(@HREA,'Risk','HREA.RISK.ASSESSMENT','Risk assessment','Risks to participants and others','Public section mapping'),
+(@HREA,'Risk','HREA.RISK.MITIGATION','Risk mitigation','Controls and mitigation measures','Public section mapping'),
+(@HREA,'Benefit','HREA.BENEFIT.DESCRIPTION','Benefits','Expected benefits and risk-benefit justification','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.PERSONAL_INFO','Personal/sensitive/health information','Whether personal, sensitive or health information is involved','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.IDENTIFIABILITY','Identifiability','Identifiability of research data','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.COLLECTION','Data collection','Data collection sources and methods','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.LINKAGE','Data linkage','Whether datasets are linked and how','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.STORAGE','Storage, security and retention','Storage, access controls, retention and destruction/archive','Public section mapping'),
+(@HREA,'Data and Privacy','HREA.DATA.SHARING','Data sharing and future use','Secondary use, sharing, future use and publication','Public section mapping'),
+(@HREA,'Safety','HREA.SAFETY.MONITORING','Safety monitoring','Safety monitoring, AE/SAE/SUSAR reporting and stopping rules','Public section mapping'),
+(@HREA,'Attachments','HREA.ATTACHMENTS.DOCUMENTS','Attachments','Protocol, PISCF, recruitment material, SAP, DMP and other documents','Public section mapping'),
+(@HREA,'Review Pathway','HREA.REVIEW.PATHWAY','Review pathway','HREC/review pathway, NMA and governance routing','Public section mapping'),
+(@HREA,'Declaration','HREA.DECLARATION','Declaration','Applicant declaration and submission confirmation','Public section mapping');
+GO
+
+/*==============================================================================
+  19. SEED INITIAL HREA FIELD MAPPINGS
+==============================================================================*/
+
+INSERT INTO form.FormQuestionMapping
+(
+    FormQuestionId,
+    SourceSchemaName,
+    SourceEntity,
+    SourceAttribute,
+    TransformationRule,
+    RequiredCondition,
+    NeedsHumanReviewFlag,
+    ConfidenceWeight
+)
+SELECT q.FormQuestionId, 'study', 'Study', 'OfficialTitle',
+       'Use study.Study.OfficialTitle as project title.', NULL, 1, 0.9500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PROJECT.TITLE';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'Study', 'LaySummary',
+       'Use lay summary. Human review required for plain language suitability.', NULL, 1, 0.9000
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PROJECT.LAY_SUMMARY';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'Study', 'ScientificSummary',
+       'Use scientific summary/background.', NULL, 1, 0.9000
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PROJECT.SCIENTIFIC_BACKGROUND';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyObjective', 'ObjectiveText',
+       'Concatenate objectives ordered by SortOrder and grouped by ObjectiveType.', NULL, 1, 0.9000
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PROJECT.AIMS';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyDesign', 'EstimatedEnrolment',
+       'Use design, sample size, allocation, masking and model fields.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.MERIT.DESIGN';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyDesign', 'SampleSizeJustification',
+       'Use sample size and power calculation narrative.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.MERIT.DESIGN';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudySite', 'StudySiteId',
+       'List sites, organisations, location descriptions and governance statuses.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.LOCATION.SITES';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyPersonRole', 'RoleTypeId',
+       'List researchers, organisations, roles and responsibilities.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.TEAM.MEMBERS';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'ParticipantPopulation', 'Description',
+       'Use participant population descriptions, special groups, rationale and safeguards.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PARTICIPANTS.GROUPS';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'EligibilityCriterion', 'CriterionText',
+       'List inclusion and exclusion criteria.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.PARTICIPANTS.ELIGIBILITY';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'RecruitmentPlan', 'RecruitmentMethod',
+       'Use recruitment method, setting, screening and target number.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.RECRUITMENT.METHOD';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'ConsentModel', 'ConsentTypeId',
+       'Use consent model, waiver/deferred flags, withdrawal and re-consent process.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.CONSENT.APPROACH';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyDataset', 'ContainsHealthInformation',
+       'Summarise personal, sensitive and health information flags across datasets.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.DATA.PERSONAL_INFO';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyDataset', 'IdentifiabilityId',
+       'Summarise identifiability across datasets.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.DATA.IDENTIFIABILITY';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'DataLinkagePlan', 'LinkageMethodId',
+       'Use data linkage plan, datasets, linkage keys, risk and mitigation.', 'Only if linked data exists.', 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.DATA.LINKAGE';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'StudyDataset', 'StorageLocation',
+       'Use storage, access controls, retention and destruction/archive fields.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.DATA.STORAGE';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'RiskAssessment', 'RiskMitigation',
+       'Use risk assessment fields and mitigation narrative.', NULL, 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.RISK.MITIGATION';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'SafetyMonitoring', 'SafetyMonitoringPlan',
+       'Use safety monitoring, AE/SAE/SUSAR and stopping rule fields.', 'Mainly for clinical trials or more-than-low-risk studies.', 1, 0.8500
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.SAFETY.MONITORING';
+
+INSERT INTO form.FormQuestionMapping
+SELECT q.FormQuestionId, 'study', 'Document', 'DocumentTypeId',
+       'List current required attachments by document type and version.', NULL, 1, 0.8000
+FROM form.FormQuestion q
+WHERE q.QuestionCode = 'HREA.ATTACHMENTS.DOCUMENTS';
+GO
+
+/*==============================================================================
+  20. USEFUL VIEWS
+==============================================================================*/
+
+CREATE OR ALTER VIEW study.vwStudySummary
+AS
+SELECT
+    s.StudyId,
+    s.ProtocolNumber,
+    s.OfficialTitle,
+    s.BriefTitle,
+    st.DisplayName AS StudyType,
+    sp.DisplayName AS StudyPhase,
+    rs.DisplayName AS RecruitmentStatus,
+    ep.DisplayName AS EthicsReviewPathway,
+    s.IsClinicalTrial,
+    s.IsTherapeuticGoodsTrial,
+    s.IsCTN,
+    s.IsCTA,
+    s.IsMultiSite,
+    s.PlannedStartDate,
+    s.StudyCompletionDate,
+    s.CurrentProtocolVersion,
+    s.ProtocolDate,
+    s.IsActive,
+    s.CreatedAt,
+    s.UpdatedAt
+FROM study.Study s
+JOIN ref.LookupValue st ON s.StudyTypeId = st.LookupValueId
+LEFT JOIN ref.LookupValue sp ON s.StudyPhaseId = sp.LookupValueId
+JOIN ref.LookupValue rs ON s.RecruitmentStatusId = rs.LookupValueId
+LEFT JOIN ref.LookupValue ep ON s.EthicsReviewPathwayId = ep.LookupValueId;
+GO
+
+CREATE OR ALTER VIEW form.vwHREAQuestionMapping
+AS
+SELECT
+    fq.FormQuestionId,
+    ft.DisplayName AS FormType,
+    fq.FormSection,
+    fq.QuestionCode,
+    fq.QuestionName,
+    fq.QuestionIntent,
+    fqm.FormQuestionMappingId,
+    fqm.SourceSchemaName,
+    fqm.SourceEntity,
+    fqm.SourceAttribute,
+    fqm.TransformationRule,
+    fqm.RequiredCondition,
+    fqm.NeedsHumanReviewFlag,
+    fqm.ConfidenceWeight
+FROM form.FormQuestion fq
+JOIN ref.LookupValue ft
+    ON fq.FormTypeId = ft.LookupValueId
+LEFT JOIN form.FormQuestionMapping fqm
+    ON fq.FormQuestionId = fqm.FormQuestionId
+WHERE ft.LookupType = 'FormType'
+  AND ft.Code = 'HREA';
+GO
+
+/*==============================================================================
+  21. FINAL VALIDATION QUERIES
+==============================================================================*/
+
+-- These SELECTs are safe and help confirm the script ran correctly.
+SELECT 'ref.LookupValue' AS ObjectName, COUNT(*) AS RowCount FROM ref.LookupValue;
+SELECT 'form.FormQuestion' AS ObjectName, COUNT(*) AS RowCount FROM form.FormQuestion;
+SELECT 'form.FormQuestionMapping' AS ObjectName, COUNT(*) AS RowCount FROM form.FormQuestionMapping;
+GO
+
+/*
+================================================================================
+END OF SCRIPT
+================================================================================
+*/
